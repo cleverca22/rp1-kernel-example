@@ -1,0 +1,36 @@
+// cc -x assembler-with-cpp -E rp1-kernel-test.dts -o temp -I /lib/modules/$(uname -r)/source/include
+// dtc temp -o rp1-kernel-test.dtbo
+
+#include <dt-bindings/clock/rp1.h>
+#include <dt-bindings/mfd/rp1.h>
+
+/dts-v1/;
+/plugin/;
+
+/{
+  compatible = "brcm,bcm2712";
+  fragment@0 {
+    target = <&gpio>;
+    __overlay__ {
+      rp1_example_pins: rp1_example_pins {
+        pins = "gpio8";
+        function = "pio";
+      };
+    };
+  };
+  fragment@1 {
+    target = <&rp1>;
+    __overlay__ {
+      rp1_example {
+        compatible = "rp1,example";
+        reg = <0xc0 0x40178000   0x0 0x4>;
+        clocks = <&rp1_clocks RP1_CLK_UART>;
+        clocks-names = "uartclk";
+        dmas = <&rp1_dma RP1_DMA_PIO_CH0_TX>;
+        dma-names = "tx";
+        pinctrl-names = "default";
+        pinctrl-0 = <&rp1_example_pins>;
+      };
+    };
+  };
+};
