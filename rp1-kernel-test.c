@@ -34,11 +34,12 @@ static ssize_t example_write(struct file *file, const char *data, size_t len,  l
   int ret = len;
   char *buffer;
 
-#if 0
+#if 1
   dma_addr_t dma;
-  buffer = dma_alloc_noncoherent(state->dev, len, &dma, DMA_TO_DEVICE, GFP_KERNEL);
+  struct device * dev = state->chan->device->dev;
+  buffer = dma_alloc_noncoherent(dev, len, &dma, DMA_TO_DEVICE, GFP_KERNEL);
 
-  printk(KERN_INFO"write %llx %ld %llx %llx\n", buffer, len, dma, state->dev);
+  printk(KERN_INFO"write %llx %ld %llx %llx\n", buffer, len, dma, dev);
   if (!buffer) return -ENOMEM;
 
   if (copy_from_user(buffer, data, len) != 0) {
@@ -46,7 +47,7 @@ static ssize_t example_write(struct file *file, const char *data, size_t len,  l
     goto done;
   }
 
-  dma_sync_single_for_device(state->dev, dma, len, DMA_TO_DEVICE);
+  dma_sync_single_for_device(dev, dma, len, DMA_TO_DEVICE);
 
   struct dma_async_tx_descriptor *desc;
 
@@ -60,15 +61,15 @@ static ssize_t example_write(struct file *file, const char *data, size_t len,  l
     ret = -EFAULT;
     goto done;
   }
-#endif
 
   for (int i=0; i<len; i++) {
     writel(buffer[i], state->regs);
   }
+#endif
 done:
-#if 0
-  dma_free_coherent(state->dev, len, buffer, dma);
-  dma_free_noncoherent(state->dev, len, buffer, dma, DMA_TO_DEVICE);
+#if 1
+  //dma_free_coherent(dev, len, buffer, dma);
+  dma_free_noncoherent(dev, len, buffer, dma, DMA_TO_DEVICE);
 #else
   devm_kfree(state->dev, buffer);
 #endif
@@ -114,9 +115,11 @@ static int example_probe(struct platform_device *pdev) {
   struct dma_slave_config tx_conf = {
     .dst_addr = state->regs,
     .dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,
+    .src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,
     .direction = DMA_MEM_TO_DEV,
     .dst_maxburst = 2,
-    .device_fc = false,
+    .dst_port_window_size = 1,
+    .device_fc = true,
   };
 
   dmaengine_slave_config(state->chan, &tx_conf);
