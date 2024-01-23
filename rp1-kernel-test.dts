@@ -23,9 +23,11 @@
     __overlay__ {
       rp1_example {
         compatible = "rp1,example";
+        //reg = <0xc0 0x40034000   0x0 0x4>;
         reg = <0xc0 0x40178000   0x0 0x4>;
         clocks = <&rp1_clocks RP1_CLK_UART>;
         clocks-names = "uartclk";
+        //dmas = <&rp1_dma RP1_DMA_UART1_TX>; // RP1_DMA_PIO_CH0_TX>;
         dmas = <&rp1_dma RP1_DMA_PIO_CH0_TX>;
         dma-names = "tx";
         pinctrl-names = "default";

@@ -6,15 +6,15 @@
 #include <linux/dmaengine.h>
 #include <linux/dma-mapping.h>
 
-struct example_state {
-  struct cdev *chardev;
-  void *regs;
-  struct device * dev;
-  struct dma_chan *chan;
-};
+#include "rp1-kernel-test.h"
 
 // not sure how to go from example_open back to the platform_device and example_state
 static struct example_state *gs;
+static dev_t characterDevice;
+
+static int example_open(struct inode *inode, struct file *file);
+static ssize_t example_write(struct file *file, const char *data, size_t len,  loff_t *offset);
+static int example_release(struct inode *inode, struct file *file);
 
 static const struct of_device_id example_ids[] = {
   { .compatible = "rp1,example", },
@@ -22,27 +22,48 @@ static const struct of_device_id example_ids[] = {
 };
 MODULE_DEVICE_TABLE(of, example_ids);
 
-static dev_t characterDevice;
+static struct file_operations char_fops = {
+  .owner = THIS_MODULE,
+  .open = example_open,
+  .write = example_write,
+  .release = example_release,
+};
 
 static int example_open(struct inode *inode, struct file *file) {
   file->private_data = gs;
   return 0;
 }
 
-static void dma_complete(void *ptr) {
-  printk(KERN_INFO"dma complete\n");
+static void dma_complete2(void *ptr, const struct dmaengine_result *result) {
+  printk(KERN_INFO"dma complete2 %d %d\n", result->result, result->residue);
 }
 
-static ssize_t example_write(struct file *file, const char *data, size_t len,  loff_t *offset) {
+static ssize_t example_write_direct(struct file *file, const char *data, size_t len,  loff_t *offset) {
   struct example_state *state = file->private_data;
   int ret = len;
-  char *buffer;
+  char *buffer = devm_kmalloc(state->dev, len, GFP_KERNEL);
 
-#if 1
+  if (copy_from_user(buffer, data, len) != 0) {
+    ret = -EFAULT;
+    goto done;
+  }
+
+  for (int i=0; i<len; i++) {
+    writel(buffer[i], state->regs);
+  }
+
+done:
+  devm_kfree(state->dev, buffer);
+  return ret;
+}
+
+static ssize_t example_write_dma(struct file *file, const char *data, size_t len,  loff_t *offset) {
+  struct example_state *state = file->private_data;
+  int ret = len;
   struct dma_async_tx_descriptor *desc;
   dma_addr_t dma;
   struct device * dev = state->chan->device->dev;
-  buffer = dma_alloc_noncoherent(dev, len, &dma, DMA_TO_DEVICE, GFP_KERNEL);
+  char *buffer = dma_alloc_noncoherent(dev, len, &dma, DMA_TO_DEVICE, GFP_KERNEL);
 
   printk(KERN_INFO"write %llx %ld %llx %llx\n", (uint64_t)buffer, len, dma, (uint64_t)dev);
   if (!buffer) return -ENOMEM;
@@ -52,11 +73,12 @@ static ssize_t example_write(struct file *file, const char *data, size_t len,  l
     goto done;
   }
 
+  //dma_addr_t iommu_dma_addr = dma_map_single(state->chan->device->dev, buffer, len, DMA_TO_DEVICE);
+
   dma_sync_single_for_device(dev, dma, len, DMA_TO_DEVICE);
 
-
-  desc = dmaengine_prep_slave_single(state->chan, dma, len, DMA_MEM_TO_DEV, DMA_PREP_INTERRUPT);
-  desc->callback = dma_complete;
+  desc = dmaengine_prep_slave_single(state->chan, dma, len, DMA_MEM_TO_DEV, DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
+  desc->callback_result = dma_complete2;
   desc->callback_param = NULL;
 
   printk(KERN_INFO"phys: %llx\n", (uint64_t)desc->phys);
@@ -68,40 +90,25 @@ static ssize_t example_write(struct file *file, const char *data, size_t len,  l
   printk(KERN_INFO"ret %d, cookie %d\n", retr, cookie);
 
   dma_async_issue_pending(state->chan);
+  printk(KERN_INFO"issued, nap time\n");
 
-  msleep(1000);
-#else
-  buffer = devm_kmalloc(state->dev, len, GFP_KERNEL);
-  if (copy_from_user(buffer, data, len) != 0) {
-    ret = -EFAULT;
-    goto done;
-  }
-
-  for (int i=0; i<len; i++) {
-    writel(buffer[i], state->regs);
-  }
-#endif
+  msleep(10000);
+  printk(KERN_INFO"nap done\n");
 done:
-#if 1
   //dma_free_coherent(dev, len, buffer, dma);
   dma_free_noncoherent(dev, len, buffer, dma, DMA_TO_DEVICE);
-#else
-  devm_kfree(state->dev, buffer);
-#endif
   return ret;
+}
+
+static ssize_t example_write(struct file *file, const char *data, size_t len,  loff_t *offset) {
+  if (len < 2) return example_write_direct(file, data, len, offset);
+  else return example_write_dma(file, data, len, offset);
 }
 
 static int example_release(struct inode *inode, struct file *file) {
   file->private_data = NULL;
   return 0;
 }
-
-static struct file_operations char_fops = {
-  .owner = THIS_MODULE,
-  .open = example_open,
-  .write = example_write,
-  .release = example_release,
-};
 
 static int example_probe(struct platform_device *pdev) {
   struct example_state *state;
@@ -111,7 +118,7 @@ static int example_probe(struct platform_device *pdev) {
     .dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,
     .src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,
     .direction = DMA_MEM_TO_DEV,
-    .dst_maxburst = 2,
+    .dst_maxburst = 4,
     .dst_port_window_size = 1,
     .device_fc = false,
   };
@@ -188,7 +195,6 @@ static struct platform_driver example_driver = {
   .probe = example_probe,
   .remove = example_remove,
 };
-
 
 module_platform_driver(example_driver);
 
