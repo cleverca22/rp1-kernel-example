@@ -67,7 +67,7 @@ static void queue_write(struct io_uring *ring, int out_fd, struct io_data *data)
   data->iov.iov_base = data + 1;
   data->iov.iov_len = data->first_len;
   data->offset = write_offset;
-  write_offset += data->iov.iov_len;
+  // write_offset += data->iov.iov_len;
 
   queue_prepped(ring, out_fd, data);
   pending_writes++;
@@ -167,7 +167,8 @@ int main(int argc, char **argv) {
     }
     struct io_data *data = io_uring_cqe_get_data(cqe);
     if (cqe->res < 0) {
-      printf("async read failed %d\n", cqe->res);
+      printf("async IO failed %d\n", cqe->res);
+      printf("read? %d\n", data->read);
       return -1;
     } else if (cqe->res != data->iov.iov_len) {
       printf("error, asked for %ld, got %d\n", data->iov.iov_len, cqe->res);
