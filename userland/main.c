@@ -1,7 +1,11 @@
+#define _GNU_SOURCE
+
 #include <assert.h>
+#include <fcntl.h>
 #include <liburing.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 // based on https://git.kernel.dk/cgit/liburing/tree/examples/io_uring-cp.c
 
@@ -76,6 +80,31 @@ uint64_t timediff(struct timespec *past, struct timespec *future) {
   return nsec + (sec * 1000000000);
 }
 
+static int setup_child(int output, int blocksize) {
+  int fds[2];
+  pipe(fds);
+  int ret = fcntl(fds[1], F_SETPIPE_SZ, blocksize);
+  if (ret < 0) {
+    perror("F_SETPIPE_SZ failed");
+    exit(-1);
+  }
+  ret = fork();
+  if (ret == 0) { // child
+    close(fds[1]);
+
+    dup2(output, 1);
+    dup2(fds[0], 0);
+    for (int i=3; i<20; i++) close(i);
+
+    char *argv[] = { "-9v", NULL };
+    execvp("gzip", argv);
+    return -1;
+  } else {
+    close(fds[0]);
+    return fds[1];
+  }
+}
+
 int main(int argc, char **argv) {
   struct io_uring ring;
 
@@ -91,13 +120,24 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  int out_fd = open("output.bin", O_WRONLY | O_CREAT, 0644);
-  if (out_fd < 0) {
+  int out_file_fd = open("output.bin.gz", O_WRONLY | O_CREAT, 0644);
+  if (out_file_fd < 0) {
     perror("cant open output\n");
     return -1;
   }
 
+  int out_fd;
   int blocksize = 1024 * 1024 * 10;
+  if (true) {
+    out_fd = setup_child(out_file_fd, blocksize);
+    if (out_fd < 0) {
+      perror("cant setup child");
+      return -1;
+    }
+  } else {
+    out_fd = out_file_fd;
+  }
+
 
   int concurrent_reads = 10;
 
