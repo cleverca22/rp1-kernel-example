@@ -32,6 +32,17 @@
         dma-names = "tx";
         pinctrl-names = "default";
         pinctrl-0 = <&rp1_example_pins>;
+        status = "disabled";
+      };
+      rp1_rx_example {
+        compatible = "rp1,rx-example";
+        reg = <0xc0 0x40178010   0x0 0x4>;
+        clocks = <&rp1_clocks RP1_CLK_UART>;
+        clocks-names = "uartclk";
+        dmas = <&rp1_dma RP1_DMA_PIO_CH0_RX>;
+        dma-names = "rx";
+        pinctrl-names = "default";
+        pinctrl-0 = <&rp1_example_pins>;
       };
     };
   };
