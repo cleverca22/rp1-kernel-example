@@ -96,7 +96,7 @@ static int setup_child(int output, int blocksize) {
     dup2(fds[0], 0);
     for (int i=3; i<20; i++) close(i);
 
-    char *argv[] = { "-9v", NULL };
+    char *argv[] = { "gzip", "-9v", NULL };
     execvp("gzip", argv);
     return -1;
   } else {
@@ -172,6 +172,7 @@ int main(int argc, char **argv) {
       return -1;
     } else if (cqe->res != data->iov.iov_len) {
       printf("error, asked for %ld, got %d\n", data->iov.iov_len, cqe->res);
+      printf("read? %d\n", data->read);
       return -1;
     }
 
@@ -198,6 +199,8 @@ int main(int argc, char **argv) {
       double bytes_per_sec = (blocksize / totaltime) * concurrent_reads;
       double bits_per_sec = bytes_per_sec * 8;
       printf("WD %f %f, %f MB, %f Mbit, pending %d %d\n", readtime, write_time, bytes_per_sec/1024/1024, bits_per_sec/1000/1000, pending_reads, pending_writes);
+
+      free(data);
 #if 1
       queue_read(&ring, pio_fd, blocksize);
       toread += blocksize;
