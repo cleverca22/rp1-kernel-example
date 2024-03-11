@@ -8,9 +8,13 @@
 
 #include "rp1-kernel-test.h"
 
+static int ringbuffer_size = 1024 * 1024 * 16;
+module_param(ringbuffer_size, int, 0444);
+
 // not sure how to go from example_open back to the platform_device and example_state
 static struct example_state *gs;
 static dev_t characterDevice;
+static struct class *pio_class;
 
 static int example_open(struct inode *inode, struct file *file);
 static ssize_t example_write(struct file *file, const char *data, size_t len,  loff_t *offset);
@@ -38,8 +42,68 @@ static struct file_operations char_fops_tx = {
   .release = example_release,
 };
 
+static void dma_cycle_complete(void *ptr, const struct dmaengine_result *result) {
+  //enum dma_status dmastat;
+  //struct dma_tx_state dma_state;
+  struct example_state *state = ptr;
+
+  printk(KERN_INFO"dma complete3 %d %d\n", result->result, result->residue);
+
+  //dmastat = dmaengine_tx_status(state->rx_chan, state->rx_ring_cookie, &dma_state);
+  // the dma_state.residue is how many bytes remain to be copied for the current cycle
+  // because dmaengine_prep_dma_cyclic was set with len/2, this callback gets ran twice, when the write-pointer is at the start and middle of the buffer
+  // due to latencies in the irq, the write-ptr is already to 1022kb past the expected point
+  //printk(KERN_INFO"last:%d used:%d residue:%d in_flight_bytes:%d, mycookie:%d\n", dma_state.last, dma_state.used, dma_state.residue, dma_state.in_flight_bytes, state->rx_ring_cookie);
+
+  state->chunk_received = true;
+  wake_up(&state->wait_queue);
+
+#if 0
+  if (ptr) {
+    struct dma_packet_in_progress *ps = ptr;
+    ps->dma_done = true;
+    wake_up(&ps->wait_queue);
+  }
+#endif
+}
+
+static int start_dma_rx_ring(struct example_state *state, int len) {
+  struct dma_async_tx_descriptor *desc;
+  struct device * dev = state->rx_chan->device->dev;
+
+  state->buffer = dma_alloc_noncoherent(dev, len, &state->dma, DMA_FROM_DEVICE, GFP_KERNEL);
+  if (!state->buffer) return -ENOMEM;
+
+  // completion callback gets ran after every len/2 bytes
+  desc = dmaengine_prep_dma_cyclic(state->rx_chan, state->dma, len, len/2, DMA_DEV_TO_MEM, DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
+  if (!desc) {
+    dev_err(state->dev, "Preparing DMA cyclic failed\n");
+    return -ENOMEM;
+  }
+  desc->callback_result = dma_cycle_complete;
+  desc->callback_param = state;
+
+  int cookie = dmaengine_submit(desc);
+  int retr = dma_submit_error(cookie);
+  //printk(KERN_INFO"ret %d, cookie %d\n", retr, cookie);
+  dma_async_issue_pending(state->rx_chan);
+
+  state->desc = desc;
+  state->rx_ring_cookie = cookie;
+
+  return 0;
+}
+
 static int example_open(struct inode *inode, struct file *file) {
   file->private_data = gs;
+
+  // TODO, grab a lock
+  if (gs->open_handle) return -EBUSY;
+  gs->open_handle = file;
+  gs->read_ptr = 0;
+
+  init_waitqueue_head(&gs->wait_queue);
+  start_dma_rx_ring(gs, ringbuffer_size);
   return 0;
 }
 
@@ -122,47 +186,90 @@ static ssize_t example_write(struct file *file, const char *data, size_t len,  l
 static ssize_t example_read(struct file *file, char *data, size_t len,  loff_t *offset) {
   //printk(KERN_INFO"example_read(%p, %p, %ld, offset)\n", file, data, len);
   struct example_state *state = file->private_data;
-  int ret = len;
-  struct dma_async_tx_descriptor *desc;
-  dma_addr_t dma;
+  int ret;
   struct device * dev = state->rx_chan->device->dev;
-
-  struct dma_packet_in_progress *packet_state = devm_kmalloc(state->dev, sizeof(struct dma_packet_in_progress), GFP_KERNEL);
-  if (!packet_state) {
-    return -ENOMEM;
-  }
-  init_waitqueue_head(&packet_state->wait_queue);
-  packet_state->dma_done = false;
-
-  char *buffer = dma_alloc_noncoherent(dev, len, &dma, DMA_FROM_DEVICE, GFP_KERNEL);
-  if (!buffer) return -ENOMEM;
-  desc = dmaengine_prep_slave_single(state->rx_chan, dma, len, DMA_DEV_TO_MEM, DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
-  desc->callback_result = dma_complete2;
-  desc->callback_param = packet_state;
-
-  int cookie = dmaengine_submit(desc);
-  int retr = dma_submit_error(cookie);
-  //printk(KERN_INFO"ret %d, cookie %d\n", retr, cookie);
-  dma_async_issue_pending(state->rx_chan);
+  enum dma_status dmastat;
+  struct dma_tx_state dma_state;
 
   // block until dma complete
-  wait_event(packet_state->wait_queue, packet_state->dma_done);
+  wait_event(state->wait_queue, state->chunk_received);
 
-  dma_sync_single_for_device(dev, dma, len, DMA_FROM_DEVICE);
-#if 1
-  if (copy_to_user(data, buffer, len) != 0) {
-    ret = -EFAULT;
-    goto done;
+  dmastat = dmaengine_tx_status(state->rx_chan, state->rx_ring_cookie, &dma_state);
+  // the dma_state.residue is how many bytes remain to be copied for the current cycle
+  // because dmaengine_prep_dma_cyclic was set with len/2, this callback gets ran twice, when the write-pointer is at the start and middle of the buffer
+  // due to latencies in the irq, the write-ptr is already to 1022kb past the expected point
+  printk(KERN_INFO"last:%d used:%d residue:%d in_flight_bytes:%d, mycookie:%d\n", dma_state.last, dma_state.used, dma_state.residue, dma_state.in_flight_bytes, state->rx_ring_cookie);
+
+  uint64_t write_ptr = ringbuffer_size - dma_state.residue;
+
+  printk(KERN_INFO"read buf:%llx len:%ld data:0x%llx\n", (uint64_t)state->buffer, len, (uint64_t)data);
+  printk(KERN_INFO"writeptr: %lld, readptr: %lld\n", write_ptr, state->read_ptr);
+
+  unsigned int available;
+  if (state->read_ptr <= write_ptr) {
+    available = write_ptr - state->read_ptr;
+  } else if (state->read_ptr > write_ptr) {
+    available = (write_ptr + ringbuffer_size) - state->read_ptr;
   }
-#endif
+  printk(KERN_INFO"available: %d\n", available);
+
+  if (len > available) len = available;
+
+  unsigned int tocopy = min(len, available);
+
+  // TODO, when the write pointer wraps, this doesnt respect the length userland asked for, causing buffer overflow
+  if (state->read_ptr <= write_ptr) {
+    printk(KERN_INFO"simplecase %d\n", tocopy);
+    dma_sync_single_for_device(dev, state->dma + state->read_ptr, tocopy, DMA_FROM_DEVICE);
+    if (copy_to_user(data, state->buffer + state->read_ptr, tocopy) != 0) {
+      ret = -EFAULT;
+      goto done;
+    }
+    state->read_ptr += tocopy;
+    ret = tocopy;
+  } else if (state->read_ptr > write_ptr) {
+    printk(KERN_INFO"complex 1\n");
+    unsigned int len1 = ringbuffer_size - state->read_ptr;
+    dma_sync_single_for_device(dev, state->dma + state->read_ptr, len1, DMA_FROM_DEVICE);
+    printk(KERN_INFO"copy_to_user(0x%llx, 0x%llx, %ld)\n", (uint64_t)(data), (uint64_t)(state->buffer + state->read_ptr), len);
+    if (copy_to_user(data, state->buffer + state->read_ptr, len) != 0) {
+      ret = -EFAULT;
+      goto done;
+    }
+    state->read_ptr += len1;
+    state->read_ptr = state->read_ptr % ringbuffer_size;
+
+    unsigned int len2 = write_ptr;
+    printk(KERN_INFO"complex 2 len1:%d len2:%d\n", len1, len2);
+    dma_sync_single_for_device(dev, state->dma + state->read_ptr, len2, DMA_FROM_DEVICE);
+    printk(KERN_INFO"copy_to_user(0x%llx, 0x%llx, %d)\n", (uint64_t)(data + len1), (uint64_t)state->buffer, len2);
+    if (copy_to_user(data + len1, state->buffer, len2) != 0) {
+      ret = -EFAULT;
+      goto done;
+    }
+    state->read_ptr += len2;
+    ret = len1 + len2;
+  }
+
+  state->chunk_received = false;
+
 done:
-  dma_free_noncoherent(dev, len, buffer, dma, DMA_TO_DEVICE);
-  devm_kfree(state->dev, packet_state);
-  return len;
+  printk(KERN_INFO"readptr: %lld\n", state->read_ptr);
+  printk(KERN_INFO"ret %d\n", ret);
+  return ret;
 }
 
 static int example_release(struct inode *inode, struct file *file) {
+  struct example_state *state = file->private_data;
+  dmaengine_terminate_sync(state->rx_chan);
+  int len = ringbuffer_size;
+
+  struct device * dev = state->rx_chan->device->dev;
+
+  dma_free_noncoherent(dev, len, state->buffer, state->dma, DMA_FROM_DEVICE);
+
   file->private_data = NULL;
+  state->open_handle = NULL;
   return 0;
 }
 
@@ -172,7 +279,8 @@ static int example_probe_rx(struct platform_device *pdev) {
     .dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,
     .src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,
     .direction = DMA_DEV_TO_MEM,
-    .dst_maxburst = 4,
+    .dst_maxburst = 1,
+    .src_maxburst = 1,
     .dst_port_window_size = 1,
     .device_fc = false,
   };
@@ -187,6 +295,7 @@ static int example_probe_rx(struct platform_device *pdev) {
     return -ENOMEM;
   }
   state->dev = dev;
+  state->open_handle = NULL;
   state->regs = devm_platform_get_and_ioremap_resource(pdev, 0, &mem);
   rx_conf.src_addr = (uint64_t)mem->start;
 
@@ -210,6 +319,11 @@ static int example_probe_rx(struct platform_device *pdev) {
   cdev_add(state->chardev, characterDevice, 1);
   dev_set_drvdata(dev, state);
   gs = state;
+
+  if (IS_ERR(device_create(pio_class, dev, characterDevice, NULL, "example%d", 1))) {
+    dev_err(dev, "cant create device\n");
+  }
+
   printk(KERN_INFO"example rx driver loaded\n");
   return 0;
 fail:
@@ -297,6 +411,7 @@ static int example_remove(struct platform_device *pdev) {
   struct example_state *state = dev_get_drvdata(dev);
   printk(KERN_INFO"example driver unloading\n");
 
+  device_destroy(pio_class, characterDevice);
   cdev_del(state->chardev);
   unregister_chrdev_region(characterDevice, 1);
 
@@ -325,7 +440,19 @@ static struct platform_driver example_driver = {
   .remove = example_remove,
 };
 
-module_platform_driver(example_driver);
+int pio_init_module(void) {
+  pio_class = class_create("pio");
+  platform_driver_register(&example_driver);
+  return 0;
+}
+
+void pio_remove_module(void) {
+  platform_driver_unregister(&example_driver);
+  class_destroy(pio_class);
+}
+
+module_init(pio_init_module);
+module_exit(pio_remove_module);
 
 MODULE_LICENSE("GPL");
 
